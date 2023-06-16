@@ -10,6 +10,9 @@ import numpy as np
 import uuid
 import tensorflow as tf
 from imgaug import augmenters as iaa
+from threading import Lock
+import gc
+read_lock = Lock()
 
 def calculatePatchSize(patchesdf, image):
     """_summary_
@@ -190,7 +193,7 @@ def applyAugmentation(images, masks, seed=None):
     return (aug_images, aug_masks)
 
 
-class generator(Sequence):
+class training_generator(Sequence):
     """A data generator to produces batches a image chips and labels based on a patches layer, training feature layers
     and imagery.
 
@@ -308,3 +311,181 @@ class generator(Sequence):
 
     def __len__(self):
         return self.numPatches//self.batch_size
+    
+class prediction_generator(Sequence):
+    """A data generator to produces batches a image chips and labels based on a patches layer, training feature layers
+    and imagery.
+
+    Args:
+        Sequence ([type]): [description]
+    """
+
+    def __init__(self, image, patches, patchSize, batch_size, augment=True, scale=True, mtype='unet'):
+        """Initilisation function
+
+        Args:
+            imageDir ([str]): A directory where the imager can be found
+            database ([type]): [description]
+            numClasses ([type]): [description]
+            patches ([type]): [description]
+            batch_size ([type]): [description]
+        """
+        # Defing the class variables
+        self.augment = augment
+        self.batch_size = batch_size
+        self.scale = scale
+        self.patchesdf = geopandas.read_file(patches)
+        self.numPatches = len(self.patchesdf)
+        self.image = image
+        self.mtype=mtype
+        img = gdal.Open(self.image)
+        self.bands = img.RasterCount
+        self.patchSize = patchSize
+        self.dtype = GDALTypeToNumpyType(img.GetRasterBand(1).DataType)
+        img=None
+        self.crs = self.patchesdf.crs.to_epsg()
+        self.length=self.__len__()
+        self.numPatches=len(geopandas.read_file(patches))       
+
+    def on_epoch_end(self, logs=None):
+        """see tensorflow.keras.utils.Sequence.on_epoch_end"""
+        #self.patchesdf = self.patchesdf.sample(frac=1).reset_index(drop=True)
+        pass
+
+    def __getitem__(self, index):
+        """see tensorflow.keras.utils.Sequence.__getitem__"""
+        # If we're aubmenting, divide the numer of patches by 4 (as there will be 4 versions of each patch)
+        # Otherwise it'll be the same as the batch size
+        if self.augment:
+            patchCount = int(self.batch_size/4)
+        else:
+            patchCount = self.batch_size
+        
+        # Get the required number of patches from the dataframe
+        patches = self.patchesdf[index * patchCount:(index + 1) * patchCount]
+
+        # Create an empty array
+        if self.mtype=='unet':
+            images = np.zeros((self.batch_size, self.patchSize, self.patchSize, self.bands), dtype=self.dtype)
+        elif self.mtype=='tunet':
+            images = np.zeros((self.batch_size, self.bands, self.patchSize, self.patchSize, 1), dtype=self.dtype)
+        else:
+            raise SystemExit("{} is not yet implimented".format(self.mtype))
+
+        # Keep track of what patch number we're up to
+        cnt=0
+        for i, row in patches.iterrows():
+
+            # Get the geom and set the projection
+            patchGeom = geopandas.GeoSeries(row['geometry'])
+            patchGeom.set_crs(epsg=self.crs, inplace=True)
+
+            # Extract the image patch making sure the column and row are an integer
+            imageds = gdal.Open(self.image)
+            transform = imageds.GetGeoTransform()
+            startrow, startcol = eastNorth2rowCol(transform, patchGeom.total_bounds[0], patchGeom.total_bounds[3])
+            patch = imageds.ReadAsArray(xoff=int(round(startcol, 0)), yoff=int(round(startrow, 0)), xsize=self.patchSize, ysize=self.patchSize)
+            imageds=None
+
+            # Put the channels last and recale the image
+            if self.mtype=='unet':
+                patch = np.transpose(patch, (1, 2, 0))
+            elif self.mtype=='tunet':
+                patch = np.reshape(patch, (patch.shape[0], patch.shape[1], patch.shape[2], 1))
+            if self.scale:
+                patch = scaleImage_0_255_image(patch)
+
+            # Get the augmented versions and add to the array or just add the patch to the array
+            if self.augment:
+                for j in range(4):
+                    if self.mtype=='unet':
+                        rotatedPatch = np.rot90(patch, k=j, axes=(0, 1))
+                    elif self.mtype=='tunet':
+                        rotatedPatch = np.rot90(patch, k=j, axes=(1, 2))
+                    images[cnt] = rotatedPatch
+                    cnt+=1
+            else:
+                images[i-index*patchCount] = patch
+                cnt+=1
+
+        return images.astype(np.float32), patches
+
+    def __len__(self):
+        """see tensorflow.keras.utils.Sequence.__len__"""
+        if self.augment:
+            length = self.numPatches*4//self.batch_size
+        else:
+            length = self.numPatches//self.batch_size
+        if length == 0:
+            length = 1
+        return length
+    
+class tgenerator(Sequence): #_noPreLoadArrays
+    """A data generator to produces batches a image chips and labels based on a patches layer, training feature layers
+    and imagery.
+
+    Args:
+        Sequence ([type]): [description]
+    """
+
+    def __init__(self, images, tsLength, grid): 
+        """Initilisation function
+
+        Args:
+            imageDir ([str]): A directory where the imager can be found
+            database ([type]): [description]
+            numClasses ([type]): [description]
+            patches ([type]): [description]
+            batch_size ([type]): [description]
+        """
+
+        self.images = images
+        self.tsLength = tsLength
+        self.grid = geopandas.read_file(grid)
+        self.length=self.__len__()
+        
+
+    def __getitem__(self, index):
+
+        # Get the grid reference
+        grid = self.grid[index:index+1]
+        bounds = grid.total_bounds #minx, miny, maxx, maxy
+        xsize = bounds[2]-bounds[0]
+        ysize = bounds[3]-bounds[1]
+        imageds = gdal.Open(self.images[0])
+        transform = imageds.GetGeoTransform()
+        startrow, startcol = eastNorth2rowCol(transform, bounds[0], bounds[3])
+        startcol = int(np.floor(startcol))
+        startrow = int(np.ceil(startrow))
+        xs = int(np.ceil(xsize/transform[1]))
+        ys = int(np.ceil(ysize/transform[1]))
+        pointData = {}
+        for image in self.images:
+            imageds = gdal.Open(image)
+            with read_lock:
+                values = imageds.ReadAsArray(xoff=startcol, yoff=startrow, xsize=xs, ysize=ys)
+                shape = values.shape
+            values = np.reshape(values, (values.shape[0], -1))
+            values = np.transpose(values)
+            for i in range(len(values)):
+                pixelData = values[i]
+                # What do we do about the 0s?
+                #if not 0 in pixelData:
+                if i not in pointData:
+                    pointData[i] = {}
+                if 'data' not in pointData[i]:
+                    pointData[i]['data'] = []
+                pointData[i]['data'].append(pixelData)
+
+        # Reorganise the data and ensure all sequences have the same length
+        data = []
+        for i in sorted(pointData):
+                data.append(pointData[i]['data'])
+        data = tf.keras.utils.pad_sequences(data, dtype='float32', padding="post", maxlen=self.tsLength)
+        
+        gc.collect()
+        return data, index, shape
+
+    def __len__(self):
+        """see tensorflow.keras.utils.Sequence.__len__"""
+        return int(len(self.grid))
